@@ -84,6 +84,10 @@ class AccessionService:
             raise ConflictError("种质资源已被其他人修改", context={"current_version": before["version"]})
         if before["status"] == "retired":
             raise ConflictError("已退出保存的资源不能修改")
+        if before["status"] == "merged":
+            raise ConflictError("已合并归档的资源为冻结档案，不能直接修改", context={
+                "merged_into_accession_id": before.get("merged_into_accession_id")
+            })
         allowed = {key: value for key, value in data.items() if key in {
             "scientific_name", "crop_name", "cultivar_name", "source_id", "passport"
         } and value is not None}

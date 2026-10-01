@@ -152,8 +152,9 @@ CREATE TABLE IF NOT EXISTS accessions (
     source_id INTEGER REFERENCES collection_sources(id),
     acquisition_type TEXT NOT NULL CHECK(acquisition_type IN ('采集','引进','交换','捐赠','育种')),
     received_on TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','quarantine','accepted','restricted','retired')),
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','quarantine','accepted','restricted','retired','merged')),
     quarantine_reason TEXT NOT NULL DEFAULT '',
+    merged_into_accession_id INTEGER REFERENCES accessions(id),
     passport_json TEXT NOT NULL DEFAULT '{}',
     version INTEGER NOT NULL DEFAULT 1,
     created_by TEXT NOT NULL,
@@ -162,6 +163,7 @@ CREATE TABLE IF NOT EXISTS accessions (
 );
 CREATE INDEX IF NOT EXISTS idx_accessions_crop ON accessions(crop_name,status);
 CREATE INDEX IF NOT EXISTS idx_accessions_source ON accessions(source_id);
+CREATE INDEX IF NOT EXISTS idx_accessions_merged ON accessions(merged_into_accession_id);
 CREATE TABLE IF NOT EXISTS accession_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     accession_id INTEGER NOT NULL REFERENCES accessions(id) ON DELETE CASCADE,
@@ -173,6 +175,66 @@ CREATE TABLE IF NOT EXISTS accession_events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_accession_events ON accession_events(accession_id,id);
+
+CREATE TABLE IF NOT EXISTS accession_merges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    merge_no TEXT NOT NULL UNIQUE,
+    kept_accession_id INTEGER NOT NULL REFERENCES accessions(id) ON DELETE RESTRICT,
+    retired_accession_id INTEGER NOT NULL REFERENCES accessions(id) ON DELETE RESTRICT,
+    candidate_id INTEGER REFERENCES duplicate_candidates(id) ON DELETE SET NULL,
+    candidate_version INTEGER NOT NULL,
+    idempotency_key TEXT,
+    field_decisions_json TEXT NOT NULL,
+    restrictions_merged_json TEXT NOT NULL,
+    before_graph_json TEXT NOT NULL,
+    after_graph_json TEXT,
+    audit_reason_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'previewed' CHECK(status IN ('previewed','completed')),
+    executed_by TEXT,
+    executed_at TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(kept_accession_id <> retired_accession_id)
+);
+CREATE INDEX IF NOT EXISTS idx_merges_kept ON accession_merges(kept_accession_id);
+CREATE INDEX IF NOT EXISTS idx_merges_retired ON accession_merges(retired_accession_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_merges_idempotency_key ON accession_merges(idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE TABLE IF NOT EXISTS accession_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    accession_no TEXT NOT NULL UNIQUE,
+    accession_id INTEGER NOT NULL REFERENCES accessions(id) ON DELETE RESTRICT,
+    merge_id INTEGER REFERENCES accession_merges(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_accession_aliases_target ON accession_aliases(accession_id);
+CREATE TABLE IF NOT EXISTS duplicate_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_key TEXT NOT NULL UNIQUE,
+    left_accession_id INTEGER NOT NULL REFERENCES accessions(id) ON DELETE RESTRICT,
+    right_accession_id INTEGER NOT NULL REFERENCES accessions(id) ON DELETE RESTRICT,
+    rule_version TEXT NOT NULL,
+    score REAL NOT NULL,
+    evidence_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','deferred','unrelated','merge_decided','superseded','invalid')),
+    decision_reason TEXT NOT NULL DEFAULT '',
+    decided_by TEXT,
+    decided_at TEXT,
+    merge_id INTEGER REFERENCES accession_merges(id) ON DELETE SET NULL,
+    snapshot_json TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(left_accession_id <> right_accession_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dup_candidates_status ON duplicate_candidates(status,score DESC);
+CREATE TABLE IF NOT EXISTS accession_merge_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    merge_id INTEGER NOT NULL REFERENCES accession_merges(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS storage_locations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -405,6 +467,7 @@ PERMISSIONS = [
     ("jobs.run", "执行后台任务", "jobs", "run"),
     ("accessions.read", "查看种质材料", "accessions", "read"),
     ("accessions.write", "维护种质材料", "accessions", "write"),
+    ("accessions.merge", "合并重复种质档案", "accessions", "merge"),
     ("inventory.read", "查看库存", "inventory", "read"),
     ("inventory.write", "维护库存", "inventory", "write"),
     ("viability.read", "查看活力检测", "viability", "read"),
@@ -468,7 +531,71 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def _migrate_accessions_for_merges(connection: sqlite3.Connection) -> None:
+    """为旧库补充合并能力：merged 状态、merged_into_accession_id 列与索引。"""
+    info = connection.execute("PRAGMA table_info(accessions)").fetchall()
+    columns = {row[1] for row in info}
+    if not columns:
+        return
+    needs_column = "merged_into_accession_id" not in columns
+    needs_check = not _accession_status_allows_merged(connection)
+    if not needs_column and not needs_check:
+        return
+    # SQLite 官方改表流程：外键关闭时 DROP/RENAME 不会改写子表引用，按名称重新解析。
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with transaction(immediate=True):
+            if needs_check:
+                old_columns = [row[1] for row in info if row[1] != "merged_into_accession_id"]
+                connection.execute(
+                    "CREATE TABLE accessions_new ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "accession_no TEXT NOT NULL UNIQUE,"
+                    "scientific_name TEXT NOT NULL,"
+                    "crop_name TEXT NOT NULL,"
+                    "cultivar_name TEXT NOT NULL DEFAULT '',"
+                    "source_id INTEGER REFERENCES collection_sources(id),"
+                    "acquisition_type TEXT NOT NULL CHECK(acquisition_type IN ('采集','引进','交换','捐赠','育种')),"
+                    "received_on TEXT NOT NULL,"
+                    "status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','quarantine','accepted','restricted','retired','merged')),"
+                    "quarantine_reason TEXT NOT NULL DEFAULT '',"
+                    "merged_into_accession_id INTEGER REFERENCES accessions(id),"
+                    "passport_json TEXT NOT NULL DEFAULT '{}',"
+                    "version INTEGER NOT NULL DEFAULT 1,"
+                    "created_by TEXT NOT NULL,"
+                    "created_at TEXT NOT NULL,"
+                    "updated_at TEXT NOT NULL)"
+                )
+                names = ", ".join(old_columns)
+                connection.execute(
+                    f"INSERT INTO accessions_new({names}) SELECT {names} FROM accessions"
+                )
+                connection.execute("DROP TABLE accessions")
+                connection.execute("ALTER TABLE accessions_new RENAME TO accessions")
+            else:
+                connection.execute(
+                    "ALTER TABLE accessions ADD COLUMN merged_into_accession_id INTEGER REFERENCES accessions(id)"
+                )
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_accessions_crop ON accessions(crop_name,status)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_accessions_source ON accessions(source_id)")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_accessions_merged ON accessions(merged_into_accession_id)")
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError(f"迁移后外键校验失败: {violations[:5]}")
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+
+def _accession_status_allows_merged(connection: sqlite3.Connection) -> bool:
+    table_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='accessions'"
+    ).fetchone()
+    return bool(table_sql and "'merged'" in (table_sql[0] or ""))
+
+
 def init_db() -> None:
+    connection = get_connection()
+    _migrate_accessions_for_merges(connection)
     timestamp = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
@@ -497,7 +624,7 @@ def init_db() -> None:
         role_permissions = {
             "registrar": ["accessions.read", "accessions.write", "inventory.read", "inventory.write"],
             "technician": ["accessions.read", "inventory.read", "viability.read", "viability.write"],
-            "curator": ["accessions.read", "inventory.read", "viability.read", "quality.review", "distribution.approve"],
+            "curator": ["accessions.read", "accessions.merge", "inventory.read", "viability.read", "quality.review", "distribution.approve"],
             "auditor": ["accessions.read", "inventory.read", "viability.read", "audit.read"],
         }
         for role_code, codes in role_permissions.items():

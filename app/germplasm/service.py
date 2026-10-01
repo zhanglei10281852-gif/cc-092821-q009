@@ -4,6 +4,7 @@ import sqlite3
 
 from app.core.clock import Clock
 from app.germplasm.accessions import AccessionService
+from app.germplasm.duplicates import DuplicateService
 from app.germplasm.inventory import InventoryService
 from app.germplasm.quality import DistributionService, QualityService
 from app.germplasm.repository import GermplasmRepository
@@ -21,6 +22,7 @@ class GermplasmService:
         self.viability = ViabilityService(connection, clock)
         self.quality = QualityService(connection, clock)
         self.distribution = DistributionService(connection, clock)
+        self.duplicates = DuplicateService(connection, clock)
 
     def dashboard(self) -> dict:
         return {

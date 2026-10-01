@@ -8,6 +8,12 @@ from fastapi import APIRouter, Depends, Query
 from app.api.dependencies import current_principal
 from app.core.security import Principal
 from app.database import get_connection, transaction
+from app.germplasm.duplicate_schemas import (
+    CandidateDecision,
+    DuplicateScanRequest,
+    MergeExecuteRequest,
+    MergePreviewRequest,
+)
 from app.germplasm.schemas import (
     AccessionCreate,
     AccessionPatch,
@@ -84,6 +90,12 @@ def list_accessions(
     principal.require("accessions.read")
     items, total = _service().repository.list_accessions(status=status, crop=crop, limit=limit, offset=offset)
     return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.get("/accessions/by-no/{accession_no}")
+def resolve_accession(accession_no: str, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("accessions.read")
+    return _service().duplicates.resolve_accession_no(accession_no)
 
 
 @router.get("/accessions/{accession_id}")
@@ -352,3 +364,94 @@ def decide_distribution(
 def distribution_detail(request_id: int, principal: Principal = Depends(current_principal)) -> dict:
     principal.require("accessions.read")
     return _service().repository.distribution_detail(request_id)
+
+
+# ---------------------------------------------------------------- 重复识别与合并
+
+@router.post("/duplicates/scan")
+def scan_duplicates(data: DuplicateScanRequest, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("accessions.merge")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).duplicates.scan(
+            min_score=data.min_score, actor=data.actor
+        )
+
+
+@router.get("/duplicates/candidates")
+def list_duplicate_candidates(
+    status: str | None = None,
+    principal: Principal = Depends(current_principal),
+) -> list[dict]:
+    principal.require("accessions.read")
+    return _service().duplicates.list_candidates(status)
+
+
+@router.get("/duplicates/candidates/{candidate_id}")
+def duplicate_candidate_detail(candidate_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("accessions.read")
+    return _service().duplicates.candidate_detail(candidate_id)
+
+
+@router.post("/duplicates/candidates/{candidate_id}/decision")
+def decide_duplicate_candidate(
+    candidate_id: int,
+    data: CandidateDecision,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("accessions.merge")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).duplicates.decide(
+            candidate_id, data.model_dump(mode="json")
+        )
+
+
+@router.post("/duplicates/candidates/{candidate_id}/merge-preview", status_code=201)
+def preview_merge(
+    candidate_id: int,
+    data: MergePreviewRequest,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("accessions.merge")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).duplicates.preview_merge(
+            candidate_id, data.model_dump(mode="json")
+        )
+
+
+@router.post("/merges/{merge_id}/execute")
+def execute_merge(
+    merge_id: int,
+    data: MergeExecuteRequest,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("accessions.merge")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).duplicates.execute_merge(
+            merge_id, data.model_dump(mode="json")
+        )
+
+
+@router.get("/merges")
+def list_merges(
+    status: str | None = None,
+    accession_id: int | None = None,
+    principal: Principal = Depends(current_principal),
+) -> list[dict]:
+    principal.require("accessions.read")
+    return _service().duplicates.list_merges(status=status, accession_id=accession_id)
+
+
+@router.get("/merges/{merge_id}")
+def merge_detail(merge_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("accessions.read")
+    return _service().duplicates.merge_detail(merge_id)
+
+
+@router.get("/merges/{merge_id}/graph/{phase}")
+def merge_graph(
+    merge_id: int,
+    phase: str,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("accessions.read")
+    return _service().duplicates.merge_graph(merge_id, phase)

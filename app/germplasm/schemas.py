@@ -297,6 +297,28 @@ class DistributionDecision(BaseModel):
     reason: str = Field(default="", max_length=500)
 
 
+class DuplicateReview(BaseModel):
+    action: str = Field(pattern="^(dismiss|defer)$")
+    expected_version: int = Field(gt=0)
+    actor: str = Field(min_length=1, max_length=100)
+    note: str = Field(default="", max_length=500)
+
+
+class MergePreview(BaseModel):
+    survivor_id: int = Field(gt=0)
+    expected_version: int = Field(gt=0)
+    field_decisions: dict[str, str] = Field(default_factory=dict)
+
+
+class MergeExecute(BaseModel):
+    survivor_id: int = Field(gt=0)
+    expected_version: int = Field(gt=0)
+    field_decisions: dict[str, str] = Field(default_factory=dict)
+    reason: str = Field(min_length=2, max_length=500)
+    actor: str = Field(min_length=1, max_length=100)
+    idempotency_key: str = Field(min_length=8, max_length=100)
+
+
 class Page(BaseModel):
     items: list[dict[str, Any]]
     total: int

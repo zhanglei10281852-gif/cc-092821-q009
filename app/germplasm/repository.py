@@ -12,6 +12,14 @@ JSON_COLUMNS = {
     "restrictions_json": "restrictions",
     "detail_json": "detail",
     "payload_json": "payload",
+    "evidence_json": "evidence",
+    "field_decisions_json": "field_decisions",
+    "before_graph_json": "before_graph",
+    "after_graph_json": "after_graph",
+    "alias_value_json": "alias_value",
+    "survivor_value_json": "survivor_value",
+    "retired_value_json": "retired_value",
+    "final_value_json": "final_value",
 }
 
 
@@ -188,6 +196,53 @@ class GermplasmRepository:
             raise NotFoundError("质量告警不存在")
         return item
 
+    def require_candidate(self, candidate_id: int) -> dict[str, Any]:
+        item = record(self.connection.execute("SELECT * FROM duplicate_candidates WHERE id=?", (candidate_id,)).fetchone())
+        if item is None:
+            raise NotFoundError("疑似重复候选不存在")
+        return item
+
+    def candidate_by_key(self, candidate_key: str) -> dict[str, Any] | None:
+        return record(self.connection.execute(
+            "SELECT * FROM duplicate_candidates WHERE candidate_key=?", (candidate_key,)
+        ).fetchone())
+
+    def list_candidates(self, *, status: str | None, limit: int, offset: int) -> tuple[list[dict], int]:
+        where = " WHERE status=?" if status else ""
+        params: list[Any] = [status] if status else []
+        total = int(self.connection.execute(f"SELECT COUNT(*) FROM duplicate_candidates{where}", params).fetchone()[0])
+        rows = self.connection.execute(
+            f"SELECT * FROM duplicate_candidates{where} ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'deferred' THEN 1 ELSE 2 END,"
+            "score DESC,id LIMIT ? OFFSET ?", (*params, limit, offset),
+        ).fetchall()
+        return records(rows), total
+
+    def require_merge(self, merge_id: int) -> dict[str, Any]:
+        item = record(self.connection.execute("SELECT * FROM merge_records WHERE id=?", (merge_id,)).fetchone())
+        if item is None:
+            raise NotFoundError("合并记录不存在")
+        return item
+
+    def merge_by_key(self, merge_key: str) -> dict[str, Any] | None:
+        return record(self.connection.execute("SELECT * FROM merge_records WHERE merge_key=?", (merge_key,)).fetchone())
+
+    def merge_detail(self, merge_id: int) -> dict[str, Any]:
+        item = self.require_merge(merge_id)
+        item["decisions"] = records(self.connection.execute(
+            "SELECT * FROM merge_field_decisions WHERE merge_id=? ORDER BY id", (merge_id,)
+        ).fetchall())
+        item["aliases"] = records(self.connection.execute(
+            "SELECT * FROM accession_aliases WHERE merge_id=? ORDER BY id", (merge_id,)
+        ).fetchall())
+        return item
+
+    def list_merges(self, *, limit: int, offset: int) -> tuple[list[dict], int]:
+        total = int(self.connection.execute("SELECT COUNT(*) FROM merge_records").fetchone()[0])
+        rows = self.connection.execute(
+            "SELECT * FROM merge_records ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
+        ).fetchall()
+        return records(rows), total
+
     def require_distribution(self, request_id: int) -> dict[str, Any]:
         item = record(self.connection.execute("SELECT * FROM distribution_requests WHERE id=?", (request_id,)).fetchone())
         if item is None:
@@ -206,6 +261,7 @@ class GermplasmRepository:
         allowed = {
             "accessions", "seed_lots", "storage_locations", "viability_tests",
             "retest_schedules", "quality_alerts", "distribution_requests",
+            "duplicate_candidates", "merge_records",
         }
         if table not in allowed:
             raise ValueError("不允许统计该数据表")

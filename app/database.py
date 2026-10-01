@@ -155,6 +155,8 @@ CREATE TABLE IF NOT EXISTS accessions (
     status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','quarantine','accepted','restricted','retired')),
     quarantine_reason TEXT NOT NULL DEFAULT '',
     passport_json TEXT NOT NULL DEFAULT '{}',
+    merged_into_id INTEGER REFERENCES accessions(id),
+    merge_id INTEGER,
     version INTEGER NOT NULL DEFAULT 1,
     created_by TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -173,6 +175,62 @@ CREATE TABLE IF NOT EXISTS accession_events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_accession_events ON accession_events(accession_id,id);
+
+CREATE TABLE IF NOT EXISTS duplicate_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_key TEXT NOT NULL UNIQUE,
+    accession_a_id INTEGER NOT NULL REFERENCES accessions(id),
+    accession_b_id INTEGER NOT NULL REFERENCES accessions(id),
+    score REAL NOT NULL CHECK(score >= 0 AND score <= 1),
+    ruleset_version TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','deferred','dismissed','merged','invalidated')),
+    survivor_id INTEGER REFERENCES accessions(id),
+    review_note TEXT NOT NULL DEFAULT '',
+    reviewed_by TEXT,
+    reviewed_at TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_duplicate_candidates_status ON duplicate_candidates(status,score DESC);
+CREATE TABLE IF NOT EXISTS merge_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    merge_key TEXT NOT NULL UNIQUE,
+    request_hash TEXT NOT NULL,
+    candidate_id INTEGER NOT NULL REFERENCES duplicate_candidates(id),
+    survivor_id INTEGER NOT NULL REFERENCES accessions(id),
+    retired_id INTEGER NOT NULL REFERENCES accessions(id),
+    reason TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL,
+    field_decisions_json TEXT NOT NULL DEFAULT '[]',
+    before_graph_json TEXT NOT NULL DEFAULT '{}',
+    after_graph_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_merge_records_pair ON merge_records(survivor_id,retired_id);
+CREATE TABLE IF NOT EXISTS merge_field_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    merge_id INTEGER NOT NULL REFERENCES merge_records(id) ON DELETE CASCADE,
+    field_name TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK(decision IN ('keep_survivor','keep_retired','combined')),
+    survivor_value_json TEXT,
+    retired_value_json TEXT,
+    final_value_json TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(merge_id,field_name)
+);
+CREATE TABLE IF NOT EXISTS accession_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    accession_id INTEGER NOT NULL REFERENCES accessions(id),
+    alias_type TEXT NOT NULL CHECK(alias_type IN ('accession_no','passport','source')),
+    alias_key TEXT NOT NULL,
+    alias_value_json TEXT NOT NULL DEFAULT '{}',
+    merge_id INTEGER NOT NULL REFERENCES merge_records(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(accession_id,alias_type,alias_key)
+);
+CREATE INDEX IF NOT EXISTS idx_aliases_accession ON accession_aliases(accession_id,alias_type);
 
 CREATE TABLE IF NOT EXISTS storage_locations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -405,6 +463,8 @@ PERMISSIONS = [
     ("jobs.run", "执行后台任务", "jobs", "run"),
     ("accessions.read", "查看种质材料", "accessions", "read"),
     ("accessions.write", "维护种质材料", "accessions", "write"),
+    ("duplicates.read", "查看疑似重复与合并记录", "duplicates", "read"),
+    ("duplicates.review", "复核并合并疑似重复", "duplicates", "review"),
     ("inventory.read", "查看库存", "inventory", "read"),
     ("inventory.write", "维护库存", "inventory", "write"),
     ("viability.read", "查看活力检测", "viability", "read"),
@@ -468,10 +528,23 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def _ensure_columns(connection: sqlite3.Connection) -> None:
+    """为早期版本建立的 accessions 表补齐合并追踪列。"""
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(accessions)").fetchall()}
+    if "merged_into_id" not in existing:
+        connection.execute("ALTER TABLE accessions ADD COLUMN merged_into_id INTEGER REFERENCES accessions(id)")
+    if "merge_id" not in existing:
+        connection.execute("ALTER TABLE accessions ADD COLUMN merge_id INTEGER")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_accessions_merged_into ON accessions(merged_into_id)"
+    )
+
+
 def init_db() -> None:
     timestamp = to_storage(utc_now())
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _ensure_columns(connection)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -495,10 +568,13 @@ def init_db() -> None:
             (administrator, timestamp),
         )
         role_permissions = {
-            "registrar": ["accessions.read", "accessions.write", "inventory.read", "inventory.write"],
+            "registrar": ["accessions.read", "accessions.write", "duplicates.read", "inventory.read", "inventory.write"],
             "technician": ["accessions.read", "inventory.read", "viability.read", "viability.write"],
-            "curator": ["accessions.read", "inventory.read", "viability.read", "quality.review", "distribution.approve"],
-            "auditor": ["accessions.read", "inventory.read", "viability.read", "audit.read"],
+            "curator": [
+                "accessions.read", "duplicates.read", "duplicates.review",
+                "inventory.read", "viability.read", "quality.review", "distribution.approve",
+            ],
+            "auditor": ["accessions.read", "duplicates.read", "inventory.read", "viability.read", "audit.read"],
         }
         for role_code, codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]

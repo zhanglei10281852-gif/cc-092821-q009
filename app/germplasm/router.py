@@ -16,10 +16,13 @@ from app.germplasm.schemas import (
     CountCreate,
     DistributionCreate,
     DistributionDecision,
+    DuplicateReview,
     HoldCreate,
     HoldRelease,
     LocationCreate,
     LotCreate,
+    MergeExecute,
+    MergePreview,
     MovePlacement,
     PlacementCreate,
     PolicyCreate,
@@ -84,6 +87,12 @@ def list_accessions(
     principal.require("accessions.read")
     items, total = _service().repository.list_accessions(status=status, crop=crop, limit=limit, offset=offset)
     return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.get("/accessions/resolve/{accession_no}")
+def resolve_accession_number(accession_no: str, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("accessions.read")
+    return _service().duplicates.resolve_number(accession_no)
 
 
 @router.get("/accessions/{accession_id}")
@@ -352,3 +361,77 @@ def decide_distribution(
 def distribution_detail(request_id: int, principal: Principal = Depends(current_principal)) -> dict:
     principal.require("accessions.read")
     return _service().repository.distribution_detail(request_id)
+
+
+@router.post("/duplicates/scan", status_code=200)
+def scan_duplicates(principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("duplicates.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).duplicates.scan()
+
+
+@router.get("/duplicates")
+def list_duplicates(
+    status: str | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("duplicates.read")
+    items, total = _service().repository.list_candidates(status=status, limit=limit, offset=offset)
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.get("/duplicates/{candidate_id}")
+def duplicate_detail(candidate_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("duplicates.read")
+    return _service().duplicates.candidate_detail(candidate_id)
+
+
+@router.post("/duplicates/{candidate_id}/review")
+def review_duplicate(
+    candidate_id: int,
+    data: DuplicateReview,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("duplicates.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).duplicates.review(candidate_id, data.model_dump(mode="json"))
+
+
+@router.post("/duplicates/{candidate_id}/preview")
+def preview_merge(
+    candidate_id: int,
+    data: MergePreview,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("duplicates.review")
+    return _service().duplicates.preview_merge(candidate_id, data.model_dump(mode="json"))
+
+
+@router.post("/duplicates/{candidate_id}/merge")
+def merge_duplicate(
+    candidate_id: int,
+    data: MergeExecute,
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("duplicates.review")
+    with transaction(immediate=True) as connection:
+        return GermplasmService(connection).duplicates.merge(candidate_id, data.model_dump(mode="json"))
+
+
+@router.get("/merges")
+def list_merges(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(current_principal),
+) -> dict:
+    principal.require("duplicates.read")
+    items, total = _service().repository.list_merges(limit=limit, offset=offset)
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.get("/merges/{merge_id}")
+def merge_detail(merge_id: int, principal: Principal = Depends(current_principal)) -> dict:
+    principal.require("duplicates.read")
+    return _service().repository.merge_detail(merge_id)
